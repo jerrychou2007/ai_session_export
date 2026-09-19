@@ -1120,6 +1120,148 @@ def test_codex_model_context_after_user_backfills_turn(tmp_path: Path) -> None:
     ]
 
 
+def _write_codex_response_item_session(path: Path, *, thread_source: str = "user", source: object = "vscode") -> None:
+    events = [
+        {
+            "timestamp": "2026-09-18T15:09:22Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "codex-item-1",
+                "cwd": "/home/user/project",
+                "source": source,
+                "thread_source": thread_source,
+                "originator": "Codex Desktop",
+            },
+        },
+        {
+            "timestamp": "2026-09-18T15:09:23Z",
+            "type": "turn_context",
+            "payload": {"model": "fixture-item-model", "cwd": "/home/user/project"},
+        },
+        {
+            "timestamp": "2026-09-18T15:09:24Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "private developer instructions"}],
+            },
+        },
+        {
+            "timestamp": "2026-09-18T15:09:25Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "<recommended_plugins>\nplugin list\n</recommended_plugins>"},
+                    {"type": "input_text", "text": "# AGENTS.md instructions for /home/user/project\n\nrules"},
+                    {"type": "input_text", "text": "<environment_context>\n<cwd>/home/user/project</cwd>\n</environment_context>"},
+                    {"type": "input_text", "text": "Please review the item fixture"},
+                ],
+            },
+        },
+        {
+            "timestamp": "2026-09-18T15:09:26Z",
+            "type": "response_item",
+            "payload": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "private reasoning"}]},
+        },
+        {
+            "timestamp": "2026-09-18T15:09:27Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "Looking at the fixture now."}],
+            },
+        },
+        {
+            "timestamp": "2026-09-18T15:09:28Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "The item fixture is fine."}],
+            },
+        },
+        {
+            "timestamp": "2026-09-18T15:09:29Z",
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {}},
+        },
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+
+
+def test_codex_response_item_messages_are_exported(tmp_path: Path) -> None:
+    session_file = tmp_path / "sessions" / "rollout-2026-09-18T15-09-22-codex-item-1.jsonl"
+    _write_codex_response_item_session(session_file)
+
+    parsed = parse_codex_session_file(session_file, {})
+
+    assert parsed is not None
+    assert [message.role for message in parsed.record.messages] == ["user", "assistant", "assistant"]
+    assert parsed.record.messages[0].content == "Please review the item fixture"
+    assert parsed.record.messages[1].content == "Looking at the fixture now."
+    assert parsed.record.messages[2].content == "The item fixture is fine."
+    assert [message.model for message in parsed.record.messages] == ["fixture-item-model"] * 3
+    assert parsed.record.title == "Please review the item fixture"
+    rendered = render_markdown(parsed.record)
+    assert "recommended_plugins" not in rendered
+    assert "AGENTS.md instructions" not in rendered
+    assert "environment_context" not in rendered
+    assert "private developer instructions" not in rendered
+    assert "private reasoning" not in rendered
+
+
+def test_codex_legacy_event_msg_wins_over_response_item_duplicates(tmp_path: Path) -> None:
+    session_file = tmp_path / "sessions" / "rollout-2026-09-18T15-09-22-codex-item-1.jsonl"
+    _write_codex_response_item_session(session_file)
+    with session_file.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "timestamp": "2026-09-18T15:09:30Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "Legacy user turn"},
+                }
+            )
+            + "\n"
+        )
+        handle.write(
+            json.dumps(
+                {
+                    "timestamp": "2026-09-18T15:09:31Z",
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "Legacy assistant turn"},
+                }
+            )
+            + "\n"
+        )
+
+    parsed = parse_codex_session_file(session_file, {})
+
+    assert parsed is not None
+    assert [message.content for message in parsed.record.messages] == ["Legacy user turn", "Legacy assistant turn"]
+
+
+def test_codex_internal_threads_are_skipped(tmp_path: Path) -> None:
+    guardian = tmp_path / "sessions" / "rollout-2026-09-18T15-09-22-codex-guardian.jsonl"
+    _write_codex_response_item_session(guardian, thread_source="guardian_review")
+    assert parse_codex_session_file(guardian, {}) is None
+
+    subagent = tmp_path / "sessions" / "rollout-2026-09-18T15-09-22-codex-subagent.jsonl"
+    _write_codex_response_item_session(subagent, thread_source="subagent", source={"subagent": {"other": "guardian"}})
+    assert parse_codex_session_file(subagent, {}) is None
+
+    automation = tmp_path / "sessions" / "rollout-2026-09-18T15-09-22-codex-automation.jsonl"
+    _write_codex_response_item_session(automation, thread_source="automation")
+    assert parse_codex_session_file(automation, {}) is not None
+
+
 def test_cursor_export_with_fixture(tmp_path: Path) -> None:
     db_path = tmp_path / "state.vscdb"
     _seed_cursor_db(db_path)

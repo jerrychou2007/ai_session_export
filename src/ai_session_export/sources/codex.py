@@ -19,6 +19,25 @@ DEFAULT_CODEX_SESSION_INDEX = Path.home() / ".codex" / "session_index.jsonl"
 SESSION_ID_PATTERN = re.compile(r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$")
 ROLLOUT_DATE_PATTERN = re.compile(r"^rollout-(\d{4}-\d{2}-\d{2})T")
 
+# Newer Codex rollouts (observed 2026-09) no longer emit `event_msg` user/agent
+# messages; the transcript lives in `response_item` records with
+# `payload.type == "message"` and a `role`. User turns there carry injected
+# workspace context as separate content items, which are not user speech.
+INJECTED_USER_CONTENT_PREFIXES = (
+    "<environment_context>",
+    "<recommended_plugins>",
+    "<user_instructions>",
+    "<permissions",
+    "<turn_aborted>",
+    "<system-reminder>",
+    "<image",
+    "# AGENTS.md instructions",
+)
+# Guardian auto-review and spawned subagent threads are Codex-internal, not
+# Jerry's conversations. `thread_source` is the stable marker; a dict-valued
+# `source` is the older encoding of the same thing.
+SKIPPED_THREAD_SOURCES = {"subagent", "guardian_review"}
+
 
 class ParsedCodexSession(NamedTuple):
     record: SessionRecord
@@ -61,6 +80,37 @@ def _date_from_path(file_path: Path) -> date | None:
     return date.fromisoformat(match.group(1)) if match else None
 
 
+def _is_internal_thread(meta: dict[str, Any]) -> bool:
+    if isinstance(meta.get("source"), dict):
+        return True
+    return str(meta.get("thread_source") or "").strip() in SKIPPED_THREAD_SOURCES
+
+
+def _message_item_text(payload: dict[str, Any], *, drop_injected: bool) -> str:
+    content = payload.get("content")
+    if isinstance(content, str):
+        parts = [content]
+    elif isinstance(content, list):
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") not in ("input_text", "output_text", "text"):
+                continue
+            parts.append(str(item.get("text") or ""))
+    else:
+        return ""
+    kept: list[str] = []
+    for part in parts:
+        text = part.strip()
+        if not text:
+            continue
+        if drop_injected and text.startswith(INJECTED_USER_CONTENT_PREFIXES):
+            continue
+        kept.append(text)
+    return "\n\n".join(kept).strip()
+
+
 def parse_codex_session_file(file_path: Path, titles: dict[str, str]) -> ParsedCodexSession | None:
     session_id = ""
     cwd = ""
@@ -68,6 +118,7 @@ def parse_codex_session_file(file_path: Path, titles: dict[str, str]) -> ParsedC
     messages: list[MessageTurn] = []
     current_model: str | None = None
     pending_user_turns: list[int] = []
+    message_origins: list[str] = []
     first_user_text = ""
     started_at: date | None = None
     latest_timestamp_ms = 0
@@ -94,6 +145,8 @@ def parse_codex_session_file(file_path: Path, titles: dict[str, str]) -> ParsedC
                 continue
 
             if event_type == "session_meta":
+                if _is_internal_thread(payload):
+                    return None
                 session_id = str(payload.get("id") or payload.get("session_id") or session_id)
                 cwd = str(payload.get("cwd") or cwd)
                 continue
@@ -109,19 +162,39 @@ def parse_codex_session_file(file_path: Path, titles: dict[str, str]) -> ParsedC
                 cwd = str(payload.get("cwd") or cwd)
                 continue
 
+            payload_type = payload.get("type")
+            if event_type == "response_item" and payload_type == "message":
+                role = str(payload.get("role") or "")
+                if role == "user":
+                    text = _message_item_text(payload, drop_injected=True)
+                    if not text:
+                        continue
+                    messages.append(
+                        MessageTurn(role="user", content=text, time_created=event_ts_ms, model=current_model)
+                    )
+                    message_origins.append("item")
+                    pending_user_turns.append(len(messages) - 1)
+                elif role == "assistant":
+                    text = _message_item_text(payload, drop_injected=False)
+                    if text:
+                        messages.append(
+                            MessageTurn(role="assistant", content=text, time_created=event_ts_ms, model=current_model)
+                        )
+                        message_origins.append("item")
+                    pending_user_turns.clear()
+                continue
+
             if event_type != "event_msg":
                 continue
 
-            payload_type = payload.get("type")
             if payload_type == "user_message":
                 text = str(payload.get("message") or "").strip()
                 if not text:
                     continue
-                if not first_user_text:
-                    first_user_text = text
                 messages.append(
                     MessageTurn(role="user", content=text, time_created=event_ts_ms, model=current_model)
                 )
+                message_origins.append("legacy")
                 pending_user_turns.append(len(messages) - 1)
             elif payload_type == "agent_message":
                 text = str(payload.get("message") or "").strip()
@@ -129,7 +202,15 @@ def parse_codex_session_file(file_path: Path, titles: dict[str, str]) -> ParsedC
                     messages.append(
                         MessageTurn(role="assistant", content=text, time_created=event_ts_ms, model=current_model)
                     )
+                    message_origins.append("legacy")
                 pending_user_turns.clear()
+
+    # A rollout that carries legacy event_msg turns is authoritative for them;
+    # only fall back to response_item turns when no legacy turns exist, so a
+    # file with both encodings is not exported twice over.
+    if "legacy" in message_origins:
+        messages = [m for m, origin in zip(messages, message_origins) if origin == "legacy"]
+    first_user_text = next((m.content for m in messages if m.role == "user"), "")
 
     if not session_id or not first_user_text or not messages or started_at is None:
         return None
