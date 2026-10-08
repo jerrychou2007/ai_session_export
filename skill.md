@@ -2,7 +2,7 @@
 name: ai-session-export
 description: >-
   Export AI coding session transcripts from OpenCode, Claude Code, Codex, Google
-  Antigravity, Cursor, DeepSeek Harness, and Second Mind into a unified Markdown
+  Antigravity, Cursor, DeepSeek Harness, Gemini CLI, Grok Build, and Second Mind into a unified Markdown
   archive. Run as a CLI or periodic cron job.
 ---
 
@@ -30,14 +30,18 @@ archive for browsing, semantic search, and downstream workflows.
 All commands run from the project root.
 
 ```bash
-# Export all sources (incremental — only new sessions since last run)
+# Export all default sources (incremental — only new sessions since last run)
+# Second Mind is opt-in and not part of "all".
 python export_sessions.py
 
 # Export a specific source
 python export_sessions.py --source antigravity
+python export_sessions.py --source second-mind
 python export_sessions.py --source codex
 python export_sessions.py --source cursor
 python export_sessions.py --source dsh
+python export_sessions.py --source gemini
+python export_sessions.py --source grok
 
 # Full re-export (ignore incremental cursor)
 python export_sessions.py --full
@@ -54,6 +58,8 @@ python export_sessions.py --antigravity-dir /path/to/brain
 python export_sessions.py --codex-dir /path/to/codex/sessions
 python export_sessions.py --cursor-db /path/to/state.vscdb
 python export_sessions.py --dsh-sessions-dir /path/to/.dsh/sessions
+python export_sessions.py --gemini-dir /path/to/.gemini/tmp
+python export_sessions.py --grok-sessions-dir /path/to/.grok/sessions
 ```
 
 The Antigravity source scans 2.0, IDE, and CLI by default. `--antigravity-dir`
@@ -106,8 +112,13 @@ Antigravity emits `surface` as `"2"`, `"ide"`, or `"cli"`.
 | Antigravity IDE | `~/.gemini/antigravity-ide/brain/*/.system_generated/logs/transcript_full.jsonl` | JSONL |
 | Antigravity CLI | `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript_full.jsonl` | JSONL |
 | Cursor | `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` | SQLite |
-| DeepSeek Harness | `~/.dsh/sessions/*/*/session.jsonl*` | Zstandard-compressed JSONL |
+| DeepSeek Harness | `~/.dsh/sessions/*/*/session[.vN].jsonl[.zstd]` | JSONL or Zstandard; select the newest generation per session directory (currently V4) |
+| Gemini CLI | `~/.gemini/tmp/*/chats/session-*.json` or `.jsonl` | JSON / JSONL |
+| Grok Build | `~/.grok/sessions/*/*/updates.jsonl` + `summary.json` | JSONL + JSON |
 | Second Mind | `./second_mind_export.json` | JSON |
+
+Second Mind is opt-in: it is excluded from the default `all` run and only
+exports with an explicit `--source second-mind`.
 
 ## Adding a New Source
 

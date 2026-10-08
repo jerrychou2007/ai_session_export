@@ -32,7 +32,12 @@ from ai_session_export.sources.codex import (
     parse_codex_session_file,
 )
 from ai_session_export.sources.cursor import DEFAULT_CURSOR_DB, export_cursor
-from ai_session_export.sources.dsh import DEFAULT_DSH_SESSIONS_DIR, export_dsh, parse_dsh_session_file
+from ai_session_export.sources.dsh import (
+    DEFAULT_DSH_SESSIONS_DIR,
+    _iter_session_files,
+    export_dsh,
+    parse_dsh_session_file,
+)
 from ai_session_export.sources.opencode import export_opencode
 from ai_session_export.sources.second_mind import export_second_mind
 from ai_session_export.state import DEFAULT_STATE, load_state, save_state
@@ -181,7 +186,7 @@ def test_state_defaults() -> None:
     state = load_state(Path("/nonexistent/ai-session-export-state.json"))
     assert state["second_mind"] == {"last_export_count": 0}
     assert state["opencode"] == {"last_session_time": 0}
-    assert state["claude_code"] == {"last_timestamp": 0}
+    assert state["claude_code"] == {"sessions": {}}
     assert state["antigravity"] == {
         "last_timestamp": 0,
         "legacy_cursor_migrated": False,
@@ -567,6 +572,73 @@ def _write_codex_session(session_dir: Path, index_file: Path, *, include_followu
     return session_file
 
 
+def _write_codex_item_completed_session(session_dir: Path, index_file: Path) -> Path:
+    """Rollout in the current Codex format, where turns arrive as item_completed events."""
+    session_dir.mkdir(parents=True, exist_ok=True)
+    index_file.write_text(
+        json.dumps(
+            {
+                "id": "codex-fixture-2",
+                "thread_name": "Fixture Item Completed Task",
+                "updated_at": "2026-06-30T09:05:00Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    events = [
+        {
+            "timestamp": "2026-06-30T09:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": "codex-fixture-2", "cwd": "/home/user/project"},
+        },
+        {
+            "timestamp": "2026-06-30T09:00:01Z",
+            "type": "turn_context",
+            "payload": {"cwd": "/home/user/project", "model": "fixture-codex-model"},
+        },
+        {
+            "timestamp": "2026-06-30T09:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "UserMessage",
+                    "id": "item-1",
+                    "content": [{"type": "text", "text": "Review the fixture project"}],
+                },
+            },
+        },
+        {
+            "timestamp": "2026-06-30T09:00:03Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "Reasoning",
+                    "id": "item-2",
+                    "summary_text": ["private reasoning"],
+                    "raw_content": [],
+                },
+            },
+        },
+        {
+            "timestamp": "2026-06-30T09:00:04Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "AgentMessage",
+                    "id": "item-3",
+                    "content": [{"type": "Text", "text": "The fixture looks good."}],
+                },
+            },
+        },
+    ]
+    session_file = session_dir / "rollout-2026-06-30T09-00-00-codex-fixture-2.jsonl"
+    session_file.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+    return session_file
+
 # --------------------------------------------------------------------------- #
 # 2. Source adapter unit tests (tmp_path + synthetic fixtures)
 # --------------------------------------------------------------------------- #
@@ -664,6 +736,241 @@ def test_claude_code_export_with_fixture(tmp_path: Path) -> None:
         'turn_models: ["claude-opus-4-6", "claude-opus-4-6", "claude-sonnet-4-6", '
         '"claude-sonnet-4-6"]' in content
     )
+
+
+def test_claude_code_resume_rewrites_one_file(tmp_path: Path) -> None:
+    projects_root = tmp_path / "projects"
+    history_file = tmp_path / "history.jsonl"
+    _write_claude_session(projects_root, history_file)
+    session_file = projects_root / "-home-user-project" / "claude-fixture-1.jsonl"
+    events = session_file.read_text(encoding="utf-8").splitlines()
+    session_file.write_text("\n".join(events[:2]) + "\n", encoding="utf-8")
+    output_dir = tmp_path / "out"
+    state = {"claude_code": {"sessions": {"other-session": {"latest_timestamp": 9_999_999_999_999}}}}
+    kwargs = dict(full=False, dry_run=False, since_date=None,
+                  project_dirs=(projects_root,), history_files=(history_file,))
+
+    first = export_claude_code(output_dir, state, **kwargs)
+    assert first["exported"] == 1
+    files = list(output_dir.glob("*.md"))
+    assert len(files) == 1
+    assert "message_count: 2" in files[0].read_text(encoding="utf-8")
+
+    with session_file.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(events[-2:]) + "\n")
+    updated = export_claude_code(output_dir, state, **kwargs)
+    assert updated["exported"] == 1
+    assert list(output_dir.glob("*.md")) == files
+    content = files[0].read_text(encoding="utf-8")
+    assert "message_count: 4" in content
+    assert "Review the fixture code" in content
+    assert "The fixture looks good." in content
+    assert "Check one more fixture" in content
+    assert "The second fixture also looks good." in content
+    assert state["claude_code"]["sessions"]["claude-fixture-1"] == {
+        "latest_timestamp": updated["latest_seen"],
+        "output_file": files[0].name,
+        "source_mtime_ns": session_file.stat().st_mtime_ns,
+    }
+    mtime = files[0].stat().st_mtime_ns
+    unchanged = export_claude_code(output_dir, state, **kwargs)
+    assert unchanged["exported"] == 0
+    assert unchanged["scanned"] == 1
+    assert unchanged["latest_seen"] == updated["latest_seen"]
+    assert files[0].stat().st_mtime_ns == mtime
+
+
+@pytest.mark.parametrize("names, expected", [
+    (["20260629_Fixture_Claude_Task.md"], "20260629_Fixture_Claude_Task.md"),
+    (["20260629_Fixture_Claude_Task_2.md", "20260629_Fixture_Claude_Task.md"],
+     "20260629_Fixture_Claude_Task.md"),
+    (["20260629_Old_title_10.md", "20260629_Old_title_2.md"], "20260629_Old_title_2.md"),
+])
+@pytest.mark.parametrize("missing_mapping", [False, True])
+def test_claude_code_legacy_migration_adopts_archive(
+    tmp_path: Path, names: list[str], expected: str, missing_mapping: bool
+) -> None:
+    projects_root = tmp_path / "projects"
+    history_file = tmp_path / "history.jsonl"
+    _write_claude_session(projects_root, history_file)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    old_record = SessionRecord(
+        source="claude_code", session_id="claude-fixture-1", title="Old title",
+        date="2026-06-29", messages=[MessageTurn(role="user", content="Old archive")],
+    )
+    old_content = render_markdown(old_record)
+    for name in names:
+        (output_dir / name).write_text(old_content, encoding="utf-8")
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"claude_code": {"last_timestamp": 9_999_999_999_999}}), encoding="utf-8")
+    state = load_state(state_file)
+    assert state["claude_code"]["sessions"] == {}
+    if missing_mapping:
+        state["claude_code"]["sessions"]["claude-fixture-1"] = {
+            "latest_timestamp": 9_999_999_999_999, "output_file": "missing.md",
+        }
+    kwargs = dict(full=False, dry_run=False, since_date=None,
+                  project_dirs=(projects_root,), history_files=(history_file,))
+
+    result = export_claude_code(output_dir, state, **kwargs)
+    assert result["exported"] == 1
+    if missing_mapping:
+        expected = "missing.md"
+    assert sorted(path.name for path in output_dir.glob("*.md")) == sorted(
+        names + ([expected] if missing_mapping else [])
+    )
+    assert state["claude_code"]["sessions"]["claude-fixture-1"]["output_file"] == expected
+    assert "The second fixture also looks good." in (output_dir / expected).read_text(encoding="utf-8")
+    for name in names:
+        if name != expected:
+            assert (output_dir / name).read_text(encoding="utf-8") == old_content
+    assert state["claude_code"]["last_timestamp"] == 9_999_999_999_999
+    assert export_claude_code(output_dir, state, **kwargs)["exported"] == 0
+
+
+def test_claude_code_true_name_collision(tmp_path: Path) -> None:
+    projects_root = tmp_path / "projects"
+    history_file = tmp_path / "history.jsonl"
+    _write_claude_session(projects_root, history_file)
+    session_file = projects_root / "-home-user-project" / "claude-fixture-1.jsonl"
+    (session_file.parent / "claude-fixture-2.jsonl").write_text(
+        session_file.read_text(encoding="utf-8").replace("claude-fixture-1", "claude-fixture-2"),
+        encoding="utf-8",
+    )
+    with history_file.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"sessionId": "claude-fixture-2", "display": "Fixture Claude Task"}) + "\n")
+    output_dir = tmp_path / "out"
+    state = {}
+    kwargs = dict(full=False, dry_run=False, since_date=None,
+                  project_dirs=(projects_root,), history_files=(history_file,))
+
+    assert export_claude_code(output_dir, state, **kwargs)["exported"] == 2
+    expected = ["20260629_Fixture_Claude_Task.md", "20260629_Fixture_Claude_Task_2.md"]
+    assert sorted(path.name for path in output_dir.glob("*.md")) == expected
+    for session_id, previous in state["claude_code"]["sessions"].items():
+        assert f'session_id: "{session_id}"' in (output_dir / previous["output_file"]).read_text(encoding="utf-8")
+    assert export_claude_code(output_dir, {}, **kwargs)["exported"] == 2
+    assert sorted(path.name for path in output_dir.glob("*.md")) == expected
+
+
+def test_claude_code_missing_output_is_recreated(tmp_path: Path) -> None:
+    projects_root = tmp_path / "projects"
+    history_file = tmp_path / "history.jsonl"
+    _write_claude_session(projects_root, history_file)
+    output_dir = tmp_path / "out"
+    state = {}
+    kwargs = dict(full=False, dry_run=False, since_date=None,
+                  project_dirs=(projects_root,), history_files=(history_file,))
+    export_claude_code(output_dir, state, **kwargs)
+    output_file = next(output_dir.glob("*.md"))
+    content = output_file.read_text(encoding="utf-8")
+    output_file.unlink()
+
+    assert export_claude_code(output_dir, state, **kwargs)["exported"] == 1
+    assert list(output_dir.glob("*.md")) == [output_file]
+    assert output_file.read_text(encoding="utf-8") == content
+
+
+def test_claude_code_missing_output_preserves_recorded_filename_after_title_change(tmp_path: Path) -> None:
+    projects_root = tmp_path / "projects"
+    history_file = tmp_path / "history.jsonl"
+    _write_claude_session(projects_root, history_file)
+    output_dir = tmp_path / "out"
+    state = {}
+    kwargs = dict(full=False, dry_run=False, since_date=None,
+                  project_dirs=(projects_root,), history_files=(history_file,))
+
+    assert export_claude_code(output_dir, state, **kwargs)["exported"] == 1
+    original_name = "20260629_Fixture_Claude_Task.md"
+    assert state["claude_code"]["sessions"]["claude-fixture-1"]["output_file"] == original_name
+    output_file = output_dir / original_name
+    output_file.unlink()
+    history_file.write_text(
+        json.dumps({"sessionId": "claude-fixture-1", "display": "Renamed fixture task"}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert export_claude_code(output_dir, state, **kwargs)["exported"] == 1
+    assert list(output_dir.glob("*.md")) == [output_file]
+    assert state["claude_code"]["sessions"]["claude-fixture-1"]["output_file"] == original_name
+    assert 'title: "Renamed fixture task"' in output_file.read_text(encoding="utf-8")
+
+
+def test_claude_code_full_preserves_identity_and_filters(tmp_path: Path) -> None:
+    projects_root = tmp_path / "projects"
+    history_file = tmp_path / "history.jsonl"
+    _write_claude_session(projects_root, history_file)
+    output_dir = tmp_path / "out"
+    state = {}
+    kwargs = dict(full=True, dry_run=False, project_dirs=(projects_root,), history_files=(history_file,))
+    assert export_claude_code(output_dir, state, since_date=None, **kwargs)["exported"] == 1
+    files = list(output_dir.glob("*.md"))
+    assert len(files) == 1
+    history_file.write_text(
+        json.dumps({"sessionId": "claude-fixture-1", "display": "Renamed fixture task"}) + "\n",
+        encoding="utf-8",
+    )
+    for next_state in (state, {}, state):
+        assert export_claude_code(output_dir, next_state, since_date=date(2026, 6, 29), **kwargs)["exported"] == 1
+        assert list(output_dir.glob("*.md")) == files
+        assert 'title: "Renamed fixture task"' in files[0].read_text(encoding="utf-8")
+    assert export_claude_code(output_dir, state, since_date=date(2026, 6, 30), **kwargs)["exported"] == 0
+
+    history_file.write_text(json.dumps({"sessionId": "claude-fixture-1", "display": "@explore subagent task"}) + "\n", encoding="utf-8")
+    assert export_claude_code(output_dir, state, since_date=None, **kwargs)["exported"] == 0
+    assert list(output_dir.glob("*.md")) == files
+
+
+@pytest.mark.parametrize("state", [{}, {"claude_code": {"last_timestamp": 9_999_999_999_999}},
+                                   {"claude_code": {"sessions": {}}}])
+@pytest.mark.parametrize("full", [False, True])
+def test_claude_code_dry_run_does_not_mutate_state_or_files(tmp_path: Path, state: dict, full: bool) -> None:
+    projects_root = tmp_path / "projects"
+    history_file = tmp_path / "history.jsonl"
+    _write_claude_session(projects_root, history_file)
+    original_state = json.loads(json.dumps(state))
+    output_dir = tmp_path / "out"
+    kwargs = dict(full=full, since_date=None, project_dirs=(projects_root,), history_files=(history_file,))
+
+    assert export_claude_code(output_dir, state, dry_run=True, **kwargs)["exported"] == 1
+    assert state == original_state
+    assert not output_dir.exists()
+
+    populated_state = {}
+    export_claude_code(output_dir, populated_state, dry_run=False, **kwargs)
+    output_file = next(output_dir.glob("*.md"))
+    mtime = output_file.stat().st_mtime_ns
+    assert export_claude_code(output_dir, state, dry_run=True, **kwargs)["exported"] == 1
+    assert state == original_state
+    previous = json.loads(json.dumps(populated_state))
+    assert export_claude_code(output_dir, populated_state, dry_run=True, **kwargs)["exported"] == int(full)
+    assert populated_state == previous
+    assert list(output_dir.glob("*.md")) == [output_file]
+    assert output_file.stat().st_mtime_ns == mtime
+
+
+@pytest.mark.parametrize("content", [
+    '---\nsource: codex\nsession_id: "claude-fixture-1"\n---\n',
+    '---\nsource: claude_code\nsession_id: "unterminated\n---\n',
+    '---\nsource: claude_code\nsession_id: "claude-fixture-1"\n',
+    'No frontmatter\n',
+])
+def test_claude_code_migration_preserves_foreign_or_unreadable_archives(tmp_path: Path, content: str) -> None:
+    projects_root = tmp_path / "projects"
+    history_file = tmp_path / "history.jsonl"
+    _write_claude_session(projects_root, history_file)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    occupied = output_dir / "20260629_Fixture_Claude_Task.md"
+    occupied.write_text(content, encoding="utf-8")
+    result = export_claude_code(
+        output_dir, {}, full=False, dry_run=False, since_date=None,
+        project_dirs=(projects_root,), history_files=(history_file,),
+    )
+    assert result["exported"] == 1
+    assert occupied.read_text(encoding="utf-8") == content
+    assert (output_dir / "20260629_Fixture_Claude_Task_2.md").is_file()
 
 
 def test_claude_missing_assistant_model_does_not_leak_later_model(tmp_path: Path) -> None:
@@ -1016,6 +1323,24 @@ def test_antigravity_dry_run_does_not_mutate_state(tmp_path: Path) -> None:
     assert state == original_state
     assert not (tmp_path / "output").exists()
 
+
+def test_codex_parses_item_completed_rollout_format(tmp_path: Path) -> None:
+    """Current Codex rollouts wrap turns in item_completed; older ones used user_message."""
+    session_dir = tmp_path / "sessions"
+    index_file = tmp_path / "session_index.jsonl"
+    session_file = _write_codex_item_completed_session(session_dir, index_file)
+
+    parsed = parse_codex_session_file(session_file, {"codex-fixture-2": "Fixture Item Completed Task"})
+
+    assert parsed is not None
+    assert [message.role for message in parsed.record.messages] == ["user", "assistant"]
+    assert parsed.record.messages[0].content == "Review the fixture project"
+    assert parsed.record.messages[1].content == "The fixture looks good."
+    assert all("private reasoning" not in message.content for message in parsed.record.messages)
+    assert [message.model for message in parsed.record.messages] == [
+        "fixture-codex-model",
+        "fixture-codex-model",
+    ]
 
 def test_codex_export_with_fixture_and_incremental_update(tmp_path: Path) -> None:
     session_dir = tmp_path / "sessions"
@@ -1729,6 +2054,331 @@ def test_dsh_unreadable_session_is_isolated(tmp_path: Path) -> None:
     assert len(list((tmp_path / "dsh").glob("*.md"))) == 1
 
 
+def _write_named_dsh_log(session_dir: Path, filename: str, text: str, *, version: int) -> Path:
+    session_dir.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "type": "session",
+            "version": version,
+            "id": session_dir.name,
+            "createdAt": DSH_FIXTURE_CREATED_AT,
+            "cwd": "/home/user/project",
+        },
+        {
+            "type": "user/message",
+            "seq": 1,
+            "time": DSH_FIXTURE_CREATED_AT + 100,
+            "surfaceOp": "append",
+            "data": {
+                "content": [{"type": "text", "text": text}],
+                "role": "user",
+                "source": {"kind": "user"},
+            },
+        },
+        {
+            "type": "assistant/message",
+            "seq": 2,
+            "time": DSH_FIXTURE_CREATED_AT + 200,
+            "data": {
+                "message": {
+                    "content": [
+                        {"type": "reasoning", "text": "hidden reasoning"},
+                        {"type": "text", "text": f"{text} reply"},
+                    ],
+                    "role": "assistant",
+                    "source": {
+                        "kind": "model",
+                        "provider": "fixture-provider",
+                        "model": "fixture-model",
+                        "replayState": {},
+                    },
+                },
+                "step": 1,
+                "turn": 1,
+                "stream": [{"type": "text-chunks"}],
+            },
+        },
+    ]
+    payload = ("\n".join(json.dumps(event) for event in events) + "\n").encode()
+    path = session_dir / filename
+    if filename.endswith(".zstd"):
+        path.write_bytes(
+            subprocess.run(["zstd", "-c", "-"], input=payload, capture_output=True, check=True).stdout
+        )
+    else:
+        path.write_bytes(payload)
+    return path
+
+
+def _set_mtime_ns(path: Path, mtime_ns: int) -> None:
+    os.utime(path, ns=(mtime_ns, mtime_ns))
+
+
+def test_dsh_legacy_and_v4_sessions_both_export(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    legacy_dir = sessions_dir / "--home-user-project--" / "session-legacy0000-1111-4222-8333-444455556666"
+    current_dir = sessions_dir / "--home-user-project--" / "session-current000-1111-4222-8333-444455556666"
+    _write_named_dsh_log(legacy_dir, "session.jsonl", "legacy generation fixture", version=0)
+    _write_named_dsh_log(current_dir, "session.v4.jsonl", "current v4 fixture", version=4)
+
+    state = {"dsh": {"sessions": {}}}
+    result = export_dsh(
+        tmp_path / "dsh", state, full=False, dry_run=False, since_date=None, sessions_dir=sessions_dir
+    )
+    assert result["scanned"] == 2
+    assert result["exported"] == 2
+    archived = "\n".join(path.read_text(encoding="utf-8") for path in (tmp_path / "dsh").glob("*.md"))
+    assert "legacy generation fixture reply" in archived
+    assert "current v4 fixture reply" in archived
+    assert "hidden reasoning" not in archived
+    assert 'models_used: ["fixture-provider/fixture-model"]' in archived
+
+
+def test_dsh_mixed_generations_export_newest_only(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    session_dir = sessions_dir / "--home-user-project--" / "session-mixed00000-1111-4222-8333-444455556666"
+    stale = _write_named_dsh_log(session_dir, "session.jsonl", "stale predecessor fixture", version=0)
+    middle = _write_named_dsh_log(session_dir, "session.v3.jsonl", "middle generation fixture", version=3)
+    current = _write_named_dsh_log(session_dir, "session.v4.jsonl", "current generation fixture", version=4)
+    (session_dir / "session.lock").write_text("lock", encoding="utf-8")
+    (session_dir / "session.v0.jsonl").write_text("not a generation", encoding="utf-8")
+    (session_dir / "session.v01.jsonl").write_text("not a generation", encoding="utf-8")
+    (session_dir / "session.v4.jsonl.bak").write_text("not a generation", encoding="utf-8")
+    _set_mtime_ns(stale, 30_000)
+    _set_mtime_ns(middle, 20_000)
+    _set_mtime_ns(current, 10_000)
+
+    selected = _iter_session_files(sessions_dir)
+    assert [path.name for path in selected] == ["session.v4.jsonl"]
+
+    state = {"dsh": {"sessions": {}}}
+    result = export_dsh(
+        tmp_path / "dsh", state, full=False, dry_run=False, since_date=None, sessions_dir=sessions_dir
+    )
+    assert result["scanned"] == 1
+    assert result["exported"] == 1
+    content = next((tmp_path / "dsh").glob("*.md")).read_text(encoding="utf-8")
+    assert "current generation fixture reply" in content
+    assert "stale predecessor fixture" not in content
+    assert "middle generation fixture" not in content
+
+
+def test_dsh_same_version_prefers_latest_mtime(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    session_dir = sessions_dir / "--home-user-project--" / "session-mtime00000-1111-4222-8333-444455556666"
+    plain = session_dir / "session.v4.jsonl"
+    compressed_name = session_dir / "session.v4.jsonl.zstd"
+    session_dir.mkdir(parents=True)
+    plain.write_text("plain", encoding="utf-8")
+    compressed_name.write_bytes(b"compressed-name")
+    _set_mtime_ns(plain, 1_000)
+    _set_mtime_ns(compressed_name, 2_000)
+
+    selected = _iter_session_files(sessions_dir)
+    assert [path.name for path in selected] == ["session.v4.jsonl.zstd"]
+
+    _set_mtime_ns(plain, 3_000)
+    selected = _iter_session_files(sessions_dir)
+    assert [path.name for path in selected] == ["session.v4.jsonl"]
+
+
+@pytest.mark.skipif(shutil.which("zstd") is None, reason="zstd binary not available")
+def test_dsh_compressed_v4_reexport_is_idempotent(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    session_dir = sessions_dir / "--home-user-project--" / "session-v4compressed-1111-4222-8333-444455556666"
+    source = _write_named_dsh_log(session_dir, "session.v4.jsonl.zstd", "compressed v4 fixture", version=4)
+    output_dir = tmp_path / "dsh"
+    state = {"dsh": {"sessions": {}}}
+
+    first = export_dsh(
+        output_dir, state, full=False, dry_run=False, since_date=None, sessions_dir=sessions_dir
+    )
+    assert first == {"source": "dsh", "scanned": 1, "exported": 1}
+    archived = list(output_dir.glob("*.md"))
+    assert len(archived) == 1
+    content = archived[0].read_text(encoding="utf-8")
+    assert "compressed v4 fixture reply" in content
+    assert "hidden reasoning" not in content
+    assert state["dsh"]["sessions"][session_dir.name]["source_mtime_ns"] == source.stat().st_mtime_ns
+
+    second = export_dsh(
+        output_dir, state, full=False, dry_run=False, since_date=None, sessions_dir=sessions_dir
+    )
+    assert second == {"source": "dsh", "scanned": 1, "exported": 0}
+    assert list(output_dir.glob("*.md")) == archived
+    assert archived[0].read_text(encoding="utf-8") == content
+
+
+def test_dsh_v4_mixed_source_kinds_keep_human_turns_only(tmp_path: Path) -> None:
+    """Injected V4 user/message kinds are not dialogue. Missing source stays."""
+    session_id = "session-v4kinds000-1111-4222-8333-444455556666"
+    human = "Human fixture prompt about the parser"
+    follow_up = "Human follow-up after the model switch"
+    legacy = "Legacy fixture prompt without a source field"
+    dropped = (
+        "Fixture agent instructions must not become a user turn.",
+        "Fixture runtime snapshot without the legacy prefix.",
+        "Fixture approval is not a human prompt.",
+        "Fixture model selection is not a human prompt.",
+        "Fixture empty source dict is not legacy.",
+        "Second fixture instruction block after the reply.",
+    )
+    events: list[dict[str, object]] = [
+        {
+            "type": "session",
+            "version": 4,
+            "id": session_id,
+            "createdAt": DSH_FIXTURE_CREATED_AT,
+            "cwd": "/home/user/project",
+        },
+        {
+            "type": "user/message",
+            "seq": 1,
+            "time": DSH_FIXTURE_CREATED_AT + 100,
+            "data": {
+                "content": [{"type": "text", "text": dropped[0]}],
+                "role": "user",
+                "source": {"kind": "agent-instructions"},
+            },
+        },
+        {
+            "type": "user/message",
+            "seq": 2,
+            "time": DSH_FIXTURE_CREATED_AT + 101,
+            "data": {
+                "content": [{"type": "text", "text": dropped[1]}],
+                "role": "user",
+                "source": {"kind": "runtime-context"},
+            },
+        },
+        {
+            "type": "user/message",
+            "seq": 3,
+            "time": DSH_FIXTURE_CREATED_AT + 200,
+            "data": {
+                "content": [{"type": "text", "text": human}],
+                "role": "user",
+                "source": {"kind": "user", "id": "fixture-user-1"},
+            },
+        },
+        {
+            "type": "assistant/message",
+            "seq": 4,
+            "time": DSH_FIXTURE_CREATED_AT + 300,
+            "data": {
+                "message": {
+                    "content": [{"type": "text", "text": "First fixture reply."}],
+                    "role": "assistant",
+                    "source": {"kind": "model", "provider": "fixture-provider", "model": "fixture-model-a"},
+                }
+            },
+        },
+        {
+            "type": "user/message",
+            "seq": 5,
+            "time": DSH_FIXTURE_CREATED_AT + 400,
+            "data": {
+                "content": [{"type": "text", "text": dropped[2]}],
+                "role": "user",
+                "source": {"kind": "user-approval"},
+            },
+        },
+        {
+            "type": "user/message",
+            "seq": 6,
+            "time": DSH_FIXTURE_CREATED_AT + 401,
+            "data": {
+                "content": [{"type": "text", "text": dropped[3]}],
+                "role": "user",
+                "source": {"kind": "model-selection"},
+            },
+        },
+        {
+            "type": "user/message",
+            "seq": 7,
+            "time": DSH_FIXTURE_CREATED_AT + 402,
+            "data": {
+                "content": [{"type": "text", "text": dropped[4]}],
+                "role": "user",
+                "source": {},
+            },
+        },
+        {
+            "type": "user/message",
+            "seq": 8,
+            "time": DSH_FIXTURE_CREATED_AT + 500,
+            "data": {"content": [{"type": "text", "text": legacy}], "role": "user"},
+        },
+        {
+            "type": "user/message",
+            "seq": 9,
+            "time": DSH_FIXTURE_CREATED_AT + 600,
+            "data": {
+                "content": [{"type": "text", "text": follow_up}],
+                "role": "user",
+                "source": {"kind": "user"},
+            },
+        },
+        {
+            "type": "assistant/message",
+            "seq": 10,
+            "time": DSH_FIXTURE_CREATED_AT + 700,
+            "data": {
+                "message": {
+                    "content": [{"type": "text", "text": "Second fixture reply."}],
+                    "role": "assistant",
+                    "source": {"kind": "model", "provider": "fixture-provider", "model": "fixture-model-b"},
+                }
+            },
+        },
+        {
+            "type": "user/message",
+            "seq": 11,
+            "time": DSH_FIXTURE_CREATED_AT + 800,
+            "data": {
+                "content": [{"type": "text", "text": dropped[5]}],
+                "role": "user",
+                "source": {"kind": "agent-instructions"},
+            },
+        },
+    ]
+    session_dir = tmp_path / "sessions" / "--home-user-project--" / session_id
+    session_dir.mkdir(parents=True)
+    (session_dir / "session.v4.jsonl").write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
+
+    parsed = parse_dsh_session_file(session_dir / "session.v4.jsonl")
+    assert parsed is not None
+    assert parsed.record.title == human
+    assert [(message.role, message.content) for message in parsed.record.messages] == [
+        ("user", human),
+        ("assistant", "First fixture reply."),
+        ("user", legacy),
+        ("user", follow_up),
+        ("assistant", "Second fixture reply."),
+    ]
+    assert len(parsed.record.messages) == 5
+    assert [message.model for message in parsed.record.messages] == [
+        "fixture-provider/fixture-model-a",
+        "fixture-provider/fixture-model-a",
+        "fixture-provider/fixture-model-b",
+        "fixture-provider/fixture-model-b",
+        "fixture-provider/fixture-model-b",
+    ]
+    rendered = render_markdown(parsed.record)
+    assert rendered.count("## User") == 3
+    assert rendered.count("## Assistant") == 2
+    assert (
+        'turn_models: ["fixture-provider/fixture-model-a", "fixture-provider/fixture-model-a", '
+        '"fixture-provider/fixture-model-b", "fixture-provider/fixture-model-b", '
+        '"fixture-provider/fixture-model-b"]'
+    ) in rendered
+    for text in dropped:
+        assert text not in rendered
+
+
 # --------------------------------------------------------------------------- #
 # 3. Integration test (self-contained; also runnable via `pytest -m integration`)
 # --------------------------------------------------------------------------- #
@@ -1775,32 +2425,59 @@ def test_cli_run_export_all_sources(tmp_path: Path) -> None:
         codex_session_index=codex_index,
         cursor_db=cursor_db,
         dsh_sessions_dir=dsh_dir,
+        gemini_dir=tmp_path / "absent-gemini",
+        grok_sessions_dir=tmp_path / "absent-grok",
     )
 
+    # Second Mind is opt-in: seeding its JSON and passing the path must not
+    # pull it into the default "all" run.
     assert {r["source"] for r in results} == {
-        "second_mind",
         "opencode",
         "claude_code",
         "antigravity",
         "codex",
         "cursor",
         "dsh",
+        "gemini",
+        "grok",
     }
 
-    # Each source produced at least one markdown file under base_dir.
-    for sub in ("second_mind", "opencode", "claude_code", "antigravity", "codex", "cursor", "dsh"):
+    # Each default source produced at least one markdown file under base_dir.
+    for sub in ("opencode", "claude_code", "antigravity", "codex", "cursor", "dsh"):
         assert list((tmp_path / sub).glob("*.md")), f"no markdown emitted for {sub}"
 
     # State file was persisted with refreshed counters.
     persisted = load_state(state_file)
-    assert persisted["second_mind"]["last_export_count"] == 1
+    assert persisted["second_mind"]["last_export_count"] == 0
     assert persisted["opencode"]["last_session_time"] > 0
-    assert persisted["claude_code"]["last_timestamp"] > 0
+    assert persisted["claude_code"]["sessions"]["claude-fixture-1"]["latest_timestamp"] > 0
     antigravity_sessions = persisted["antigravity"]["surfaces"]["ide"]["sessions"]
     assert antigravity_sessions["antigravity-session-fixture"]["status"] == "complete"
     assert persisted["codex"]["sessions"]["codex-fixture-1"]["latest_timestamp"] > 0
     assert persisted["cursor"]["sessions"]["a6f723dc-9c5b-4169-b03f-31abb1e6069b"]["latest_timestamp"] > 0
     assert persisted["dsh"]["sessions"][DSH_FIXTURE_SESSION_ID]["latest_timestamp"] > 0
+
+
+@pytest.mark.integration
+def test_cli_run_export_second_mind_opt_in(tmp_path: Path) -> None:
+    second_mind_json = tmp_path / "second_mind_export.json"
+    _write_second_mind_json(second_mind_json)
+
+    state_file = tmp_path / ".export_state.json"
+    results = run_export(
+        "second-mind",
+        full=True,
+        dry_run=False,
+        base_dir=tmp_path,
+        state_file=state_file,
+        second_mind_json=second_mind_json,
+    )
+
+    assert [r["source"] for r in results] == ["second_mind"]
+    assert results[0]["exported"] == 1
+    assert list((tmp_path / "second_mind").glob("*.md"))
+    persisted = load_state(state_file)
+    assert persisted["second_mind"]["last_export_count"] == 1
 
 
 def test_cli_main_reports_partial_antigravity_failure(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1817,6 +2494,8 @@ def test_cli_main_reports_partial_antigravity_failure(monkeypatch: pytest.Monkey
         codex_session_index=Path("/tmp/example-codex-index.jsonl"),
         cursor_db=Path("/tmp/example-cursor.db"),
         dsh_sessions_dir=Path("/tmp/example-dsh-sessions"),
+        gemini_dir=Path("/tmp/example-gemini"),
+        grok_sessions_dir=Path("/tmp/example-grok-sessions"),
         since_date=None,
     )
     monkeypatch.setattr(cli_module, "parse_args", lambda: args)

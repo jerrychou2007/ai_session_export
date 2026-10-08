@@ -1,5 +1,45 @@
 ## Changelog
 
+### 2026-09-27
+
+- DSH discovery now accepts immutable generations `session.vN.jsonl` and `session.vN.jsonl.zstd` in addition to legacy `session.jsonl` / `session.jsonl.zstd`. Each session directory exports only its highest generation, so a migrated predecessor cannot win the session-id dedupe and hide later turns. Two encodings of that same version resolve by latest mtime, then filename. Non-canonical names (`.v0`, leading zeros, backups, `session.lock`) are ignored. The V4 dialogue fields the parser already reads (`user/message` text, assembled `assistant/message` text, `source.provider` / `source.model`) are unchanged, so no parser edit was required.
+- V4 `user/message` events are not all human input. When `data.source` is a dict, the parser keeps only `source.kind == "user"`. `agent-instructions`, `runtime-context`, `user-approval`, and `model-selection` are dropped even when their text is nonempty and does not match the older reminder or runtime-context prefix filters. Events that omit `source` stay accepted, so legacy V0 user messages are not dropped. Synthetic coverage checks mixed kinds, human title fallback, `turn_models` alignment, and parse count.
+
+### 2026-09-26
+
+- Second Mind is now opt-in: the default `all` run no longer touches `second_mind_export.json`, so a missing export file no longer aborts every other source with `FileNotFoundError`. `--source second-mind` remains available and still fails fast when its JSON is missing. The "all" integration test now seeds the Second Mind fixture and asserts it stays out; a new integration test locks in the explicit opt-in path.
+
+### 2026-09-10
+
+- Fixed #7: Claude Code now tracks timestamps and output filenames per session, rewrites resumed sessions in place, and adopts existing archives by frontmatter identity when upgrading legacy state. Full exports preserve output identity and filters; dry-runs leave files and caller state untouched. Added synthetic regressions for growth, migration, prior duplicates, collisions, missing outputs, full exports, and dry-runs.
+
+### 2026-09-08 (maintainer review round 2)
+
+- Stale-archive retirement is now provable-rewind-only: Gemini retires when the JSON snapshot's messages were emptied or the JSONL replay ends in a rewind with no surviving messages; Grok retires when a `rewind_marker` trail leaves no surviving prompt runs. Noise-title rewrites, subagent kinds, and other parser rejections no longer delete archives, and `--since-date` scopes retirement by session start time.
+- Gemini migration comparison now replays the JSONL (direct messages, same-id replacements, `$set.messages` checkpoints, `$rewindTo`) instead of counting raw lines, so interrupted migrations and duplicate-id replay both pick the more complete source.
+- Per-file failure isolation widened to `except Exception` (aligning with DSH): malformed JSON floats (e.g. `1e309` timestamps) can raise `OverflowError`, which previously aborted the whole run before `save_state`.
+- Grok hidden user echoes now advance the prompt-model state before being dropped, so a runtime wake on a new model attributes the following assistant turn correctly; `rewind_marker` resets both the stitching key and the model-attribution state.
+- Added regression tests: noise-title rename survival, since-date retirement scoping, checkpoint/duplicate-id migration, hidden-prompt model attribution, rewind stitching boundary, `OverflowError` isolation.
+
+### 2026-09-08 (maintainer review pass)
+
+- Gemini adapter drops machine-injected user content (`<session_context>`, `<hook_context>`, slash/help commands), mirroring gemini-cli's `isIgnoredUserContent`; hook output and environment context no longer enter the archive as user turns.
+- Gemini adapter falls back to raw `content` whenever `displayContent` yields empty text, matching the UI's `displayContentString || contentString` semantics.
+- Gemini JSON→JSONL migration: a same-name JSONL now only supersedes the legacy JSON once its replayed message count catches up; mid-migration sessions export from the JSON instead of silently truncating.
+- Grok adapter hides model-only user echoes by prompt-id prefix (`task-completed-`, `subagent-completed-`, `workflow-completed-`, `notifications-`, `goal-summary-`, `goal-classifier-nudge-`) and by legacy bare auto-wake text (`<system-reminder>`, `<monitor-event>`, monitor-drain heads), matching the upstream scrollback policy.
+- Grok adapter treats any `session_kind` starting with `subagent` (including `subagent_resume`) as hidden, matching upstream `Summary::is_hidden()` prefix semantics.
+- Grok adapter attributes per-turn models from chunk `_meta.modelId` (user turn + preceding unmatched turns), keeping `turn_models` populated across mid-session model switches; the summary's `current_model_id` is merged into `models_used` as session inventory only.
+- Both adapters retire a previously exported session's archive file (and state entry) when a rewind empties the live conversation, so dead branches do not linger after the provider deleted them; dry-run reports the retirement without deleting.
+- Both adapters report per-file failure diagnostics (`path` + exception type/message) as `warnings`, aligned with the DSH adapter's diagnosability; the CLI prints them to stderr.
+- Registered both sources in the public `skill.md` data-location table.
+
+### 2026-09-08
+
+- Support for `gemini` source adapter (`--source gemini`, `--gemini-dir`) matching public structures in `google-gemini/gemini-cli` (reading JSON/JSONL, replaying checkpoints/rewinds, filtering subagents/tools/thoughts).
+- Support for `grok` source adapter (`--source grok`, `--grok-sessions-dir`) matching public structures in `xai-org/grok-build` (parsing `updates.jsonl` and `summary.json`, stitching streaming text, obeying rewinds, omitting thoughts/hidden host prompts).
+- Common stability features: stable output paths, dry-run safety, zero-byte writes for unchanged files, and counted/retryable malformed sessions.
+- Improves Grok Build rewind fidelity and introduces isolated failure handling and retry after repair for malformed sessions.
+
 ### 2026-08-14
 
 - Added the DeepSeek Harness source adapter (`src/ai_session_export/sources/dsh.py`), registered in `sources/__init__.py`, `cli.py`, and `state.py` (`DEFAULT_STATE`).
@@ -53,6 +93,14 @@
 
 ## Lessons Learned
 
+- **Stable output identity needs a migration path.** Replacing a global cursor with an empty per-session map alone duplicates existing archives on upgrade. Adopt files by frontmatter session identity before allocating a filename; dates and sanitized titles are not ownership keys.
+
+### Key Learnings: Stateful CLI Integration
+
+1. **Replay-based Reconstruction**: Both Gemini CLI and Grok Build maintain history as sequential transition logs (events, replacements, and rewinds) rather than static snapshots. Reconstructing clean conversations requires sequentially replaying these mutations rather than simple log stitching.
+2. **Omission of Auxiliary Tracks**: Users expect clean, readable Markdown. Internal cognitive tracks (thoughts, tools, hidden host system prompts, subagent sub-trees) must be systematically stripped during processing to preserve a pure User/Assistant dialogue.
+3. **Idempotence and Stability**: By mapping variable states (such as rewinds or growing lists) to a stable output filepath, and verifying contents before writing, the exporter prevents redundant disk operations and file thrashing.
+
 - **A product family is not one incremental domain.** Antigravity 2.0, IDE, and CLI use related transcript formats but write independently. A shared maximum timestamp can suppress unseen sessions from another surface; state must be scoped by surface and session.
 - **A parse failure is state, not just an exception.** Continuing past one bad transcript is necessary, but marking a partial session complete would make the data loss permanent. Failed fingerprints stay retryable and make cron report partial success explicitly.
 - **Legacy cursors encode historical scope.** The old Antigravity cursor represented only the IDE root, so applying it to newly discovered 2.0 or CLI roots would silently discard their history.
@@ -71,5 +119,7 @@
 - **DSH session directory ids are not a single namespace either.** Top-level sessions use `session-<uuid>` directories, but subagent children materialize under bare uuids. A discovery glob keyed on the `session-` prefix returned 6 of 7 real files with no warning — the same failure class as the Cursor bubble/header split, caught only by diffing directory listings against parsed headers.
 - **DSH duplicates user speech through two channels.** `agent/inbox/spliced` mirrors user input around turn boundaries and `assistant/chunk`/packed chunk rows mirror the streaming transcript. Reading either duplicates the archive; only the canonical `user/message` and assembled `assistant/message` events carry the dialogue.
 - **DSH injects workspace instructions as user messages.** The `<system-reminder>` wrapper arrives as a regular `user/message` event, so a naive export turns injected AGENTS.md content into phantom user turns. Stripping the wrapper before the empty-text check drops reminder-only messages entirely while preserving user text that merely sits beside a reminder. The runtime-context snapshot is a second injection class with no wrapper; its stable `Current runtime context.` prefix (generated by dsh-system-prompt) is the filter anchor.
+- **V4 `user/message` is not human speech.** The same event type also carries `agent-instructions`, `runtime-context`, `user-approval`, and `model-selection`. Text anchors miss injections that are not wrapped in `<system-reminder>` and do not start with `Current runtime context.` When `data.source` is a dict, only `kind == "user"` is dialogue. Missing `source` must stay accepted: legacy V0 events have no source field, and treating absence as a rejection drops real user turns.
 - **Per-message model beats session-sparse request context.** Real DSH logs carry one `request/header` per multi-turn session but tag every `assistant/message` with `source.{provider, model}`. Attributing from the request header alone leaves later user turns `null` in `turn_models`; the per-message source back-fills every turn.
 - **A torn Zstandard frame still streams its complete prefix.** `zstd -d -c` exits nonzero on a truncated final frame after emitting the earlier frames' bytes. `check=True` turned the realistic crash state into a permanent export failure; tolerating nonzero-with-output preserves the durable prefix, and only zero-output corruption stays a retryable failure.
+- **A suffix glob exports the stale generation.** `session.v4.jsonl.zstd` does not match `session.jsonl*`. Widening discovery is not enough: lexicographic order reads `session.jsonl` before `session.v4.jsonl`, and the session-id dedupe then drops the current generation. Select the highest version per directory. Use mtime only to split two encodings of that same version.

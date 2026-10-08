@@ -52,6 +52,22 @@ def _iter_session_files(session_dirs: tuple[Path, ...]) -> list[Path]:
     return sorted(files)
 
 
+def _item_content_text(item: dict, *, drop_injected: bool = False) -> str:
+    """Join the text parts of an item_completed message.
+
+    Content entries are `{"type": "text"|"Text", "text": ...}`; the casing differs
+    between user and agent items, so match on the payload key instead of the type.
+    """
+    parts = []
+    for entry in item.get("content") or []:
+        if not isinstance(entry, dict):
+            continue
+        text = str(entry.get("text") or "").strip()
+        if text and not (drop_injected and text.startswith(INJECTED_USER_CONTENT_PREFIXES)):
+            parts.append(text)
+    return "\n".join(parts).strip()
+
+
 def _load_session_titles(index_file: Path) -> dict[str, str]:
     titles: dict[str, str] = {}
     if not index_file.is_file():
@@ -187,8 +203,33 @@ def parse_codex_session_file(file_path: Path, titles: dict[str, str]) -> ParsedC
             if event_type != "event_msg":
                 continue
 
+            role: str | None = None
+            text = ""
+
             if payload_type == "user_message":
-                text = str(payload.get("message") or "").strip()
+                role, text = "user", str(payload.get("message") or "").strip()
+            elif payload_type == "agent_message":
+                role, text = "assistant", str(payload.get("message") or "").strip()
+            elif payload_type == "item_completed":
+                # Current rollout format: turns arrive as completed items rather than
+                # user_message/agent_message events. Anything other than the two
+                # message kinds (Reasoning, command output, ...) stays private.
+                item = payload.get("item")
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "UserMessage":
+                    role = "user"
+                elif item_type == "AgentMessage":
+                    role = "assistant"
+                else:
+                    continue
+                text = _item_content_text(item, drop_injected=role == "user")
+
+            if role is None:
+                continue
+
+            if role == "user":
                 if not text:
                     continue
                 messages.append(
@@ -196,8 +237,7 @@ def parse_codex_session_file(file_path: Path, titles: dict[str, str]) -> ParsedC
                 )
                 message_origins.append("legacy")
                 pending_user_turns.append(len(messages) - 1)
-            elif payload_type == "agent_message":
-                text = str(payload.get("message") or "").strip()
+            else:
                 if text:
                     messages.append(
                         MessageTurn(role="assistant", content=text, time_created=event_ts_ms, model=current_model)
@@ -205,9 +245,10 @@ def parse_codex_session_file(file_path: Path, titles: dict[str, str]) -> ParsedC
                     message_origins.append("legacy")
                 pending_user_turns.clear()
 
-    # A rollout that carries legacy event_msg turns is authoritative for them;
-    # only fall back to response_item turns when no legacy turns exist, so a
-    # file with both encodings is not exported twice over.
+    # A rollout that carries event_msg message turns (legacy messages or current
+    # completed items) is authoritative. Only fall back to response_item turns
+    # when no event_msg message turns exist, so a file with both encodings is
+    # not exported twice over.
     if "legacy" in message_origins:
         messages = [m for m, origin in zip(messages, message_origins) if origin == "legacy"]
     first_user_text = next((m.content for m in messages if m.role == "user"), "")
