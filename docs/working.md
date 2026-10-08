@@ -1,5 +1,11 @@
 ## Changelog
 
+### 2026-10-08 (Fork integration)
+
+- Integrated upstream `869cddb6537a0eba781f66019d197d4c3b273a27` while retaining the Fork's `response_item` message parsing, injected context filtering, and internal-thread exclusion. The current `item_completed` format uses the same user-content guard.
+- Synthetic integration regressions verify mirrored-format deduplication, preservation of genuinely repeated turns and prose quoting wrapper tags, and automation-thread acceptance. All 117 offline tests pass; live source stores are excluded.
+- Message-bearing `event_msg` records remain authoritative for the whole file when mirrored `response_item` records exist. Hypothetical partially mixed encodings remain outside this guarantee; content-wide deduplication would incorrectly erase genuine repeats.
+
 ### 2026-09-27
 
 - DSH discovery now accepts immutable generations `session.vN.jsonl` and `session.vN.jsonl.zstd` in addition to legacy `session.jsonl` / `session.jsonl.zstd`. Each session directory exports only its highest generation, so a migrated predecessor cannot win the session-id dedupe and hide later turns. Two encodings of that same version resolve by latest mtime, then filename. Non-canonical names (`.v0`, leading zeros, backups, `session.lock`) are ignored. The V4 dialogue fields the parser already reads (`user/message` text, assembled `assistant/message` text, `source.provider` / `source.model`) are unchanged, so no parser edit was required.
